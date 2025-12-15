@@ -1,287 +1,374 @@
-import cv2
-from datetime import datetime, timezone
-from ultralytics import YOLO
-import numpy as np
+import time
+import signal
+import csv
 import os
+from datetime import datetime, timezone
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+#util module (must define get_car, read_license_plate, write_csv)
 import util
-from sort.sort import Sort  # tracking
-import json
-from pathlib import Path
+from sort.sort import Sort
 
-# ---------------- CONFIG -----------------
-VIDEO_DIR = r"sample_vids"
-OUT_CSV = "test.csv"
-CONF_THRESHOLD = 0.5
-FLUSH_EVERY_N_FRAMES = 5       # flush results to CSV every N frames
-MAX_COPIES_PER_PLATE = 2       # store up to 2 entries per plate dynamically
-MAX_DETECTIONS_PER_PLATE = 2   # stop video if any plate detected more than this
-RESULTS_FILE = Path("results.json")  # File to store all results
-# -----------------------------------------
+# ----------------- CONFIG -----------------
+MODEL_COCO = "yolov8n.pt"                 # vehicle detector
+MODEL_LP = "license_plate_detector_3.pt"   # license plate detector provided by repo
+VIDEO_PATH = "./sample.mp4"              # input video
+OUT_CSV = "./test.csv"                   # CSV to write (full dump)
+CONF_THRESH = 0.25                       # detection confidence threshold
+VEHICLE_CLASSES = [2, 3, 5, 7]           # COCO class ids considered "vehicles" (car, motorcycle, bus, truck etc.)
+FLUSH_INTERVAL_SECS = 5                  # flush CSV at least every N seconds
+FLUSH_EVERY_N_FRAMES = 100               # also flush every N frames
+PRINT_EVERY_N_FRAMES = 100               # show progress every N frames
+# ------------------------------------------
 
-# Load YOLO models
-MODEL_CAR = YOLO("yolov8n.pt")  # Identify type of vehicle
-MODEL_LP = YOLO("license_plate_detector_3.pt")  # crop and send licence plate
+# tracker
+mot_tracker = Sort()
 
-# Initialize tracker
-tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
+# load models
+print("Loading YOLO models...")
+coco_model = YOLO(MODEL_COCO)
+license_plate_detector = YOLO(MODEL_LP)
+print("Models loaded.")
 
+# open video
+cap = cv2.VideoCapture(VIDEO_PATH)
+if not cap.isOpened():
+    raise SystemExit(f"Cannot open video: {VIDEO_PATH}")
 
-def add_or_replace_plate(written_plates, lp_text, entry, bbox_score):
-    if lp_text not in written_plates:
-        written_plates[lp_text] = []
+# results dict (same structure as your original)
+results = {}
 
-    plate_list = written_plates[lp_text]
+# graceful stop variables
+last_write = time.time()
+stop_requested = False
 
-    if len(plate_list) < MAX_COPIES_PER_PLATE:
-        plate_list.append({"bbox_score": bbox_score, "entry": entry})
-        return True
+def _sigint_handler(sig, frame):
+    global stop_requested
+    print("\nSIGINT received — will stop after finishing current frame and flush CSV.")
+    stop_requested = True
 
-    # Replace lowest scored if new detection is better
-    min_idx, min_score = None, float("inf")
-    for i, it in enumerate(plate_list):
-        if it["bbox_score"] < min_score:
-            min_score = it["bbox_score"]
-            min_idx = i
+signal.signal(signal.SIGINT, _sigint_handler)
 
-    if bbox_score > min_score and min_idx is not None:
-        plate_list[min_idx] = {"bbox_score": bbox_score, "entry": entry}
-        return True
+print(f"Starting processing video: {VIDEO_PATH}")
+frame_nmr = -1
 
-    return False
-
-
-def build_results_from_written(written_plates):
-    results = {}
-    for entries in written_plates.values():
-        for item in entries:
-            e = item["entry"]
-            frame = e["frame"]
-            car_id = e["car_id"]
-            det_dict = e["data"]
-
-            if frame not in results:
-                results[frame] = {}
-            results[frame][car_id] = det_dict
-    return results
-
-
-def process_video(video_path):
-    print(f"▶ Processing: {video_path}")
-    cap = cv2.VideoCapture(video_path)
-
-    frame_count = 0
-    written_plates = {}          # store top-2 per plate
-    plate_detection_count = {}   # counts number of detections per plate
-    csv_created = False          # ensure CSV is created at least once
-
-    while cap.isOpened():
+try:
+    while True:
+        frame_nmr += 1
         ret, frame = cap.read()
+
         if not ret:
+            print("End of video reached.")
             break
 
-        frame_count += 1
-        print(f"🧩 DEBUG: Processing frame {frame_count}")
+        h, w = frame.shape[:2]
+        if h == 0 or w == 0:
+            print(f"Skipping empty frame {frame_nmr}")
+            continue
 
-        # # Detect cars
-        # car_detections = MODEL_CAR.predict(frame, conf=CONF_THRESHOLD, classes=[2, 3, 5, 7], verbose=False)[0]
-        # car_boxes = []
-        # for box in car_detections.boxes:
-        #     x1, y1, x2, y2 = box.xyxy[0]
-        #     car_boxes.append([x1, y1, x2, y2, box.conf[0]])
-        # car_boxes = np.array(car_boxes)
-        
-        CLASS_NAMES = {
-            2: "car",
-            3: "motorcycle",
-            5: "bus",
-            7: "truck"
-        }
+        results.setdefault(frame_nmr, {})
 
-        
-        car_detections = MODEL_CAR.predict(
-            frame,
-            conf=CONF_THRESHOLD,
-            classes=[2, 3, 5, 7],
-            verbose=False
-        )[0]
+        # --- 1) detect vehicles (COCO) ---
+        try:
+            dets = coco_model(frame, conf=CONF_THRESH, verbose=False)[0]
+        except Exception as e:
+            print(f"[frame {frame_nmr}] coco_model inference error: {e}")
+            dets = None
 
-        vehicle_info = []  # store one or many vehicles per frame
-        car_boxes = []
-        
-        # for box in car_detections.boxes:
-        #     x1, y1, x2, y2 = box.xyxy[0]
-        #     conf = float(box.conf[0])
-        #     car_boxes.append([x1, y1, x2, y2, box.conf[0]])
-        #     print("class id- ",cls_id)
-        #     cls_id = int(box.cls[0])
-        #     category = CLASS_NAMES.get(cls_id, "unknown")
+        detections_ = []
+        if dets and hasattr(dets, "boxes") and len(dets.boxes):
+            for detection in dets.boxes.data.tolist():
+                x1, y1, x2, y2, score, class_id = detection
+                if int(class_id) in VEHICLE_CLASSES:
+                    detections_.append([x1, y1, x2, y2, score])
 
-        #     vehicle_info.append({
-        #         "category": category,
-        #         "bbox": [float(x1), float(y1), float(x2), float(y2)],
-        #         "score": conf
-        #     })
-        for box in car_detections.boxes:
-            x1, y1, x2, y2 = box.xyxy[0]
-            conf = float(box.conf[0])
-            car_boxes.append([x1, y1, x2, y2, box.conf[0]])
+        dets_np = np.asarray(detections_) if len(detections_) else np.empty((0,5))
 
-            cls_id = int(box.cls[0])        # FIX: assign first
-            print("class id-", cls_id)      
+        # --- 2) update tracker (SORT) ---
+        try:
+            track_ids = mot_tracker.update(dets_np)
+        except Exception as e:
+            print(f"[frame {frame_nmr}] SORT update error: {e}")
+            track_ids = np.empty((0,5))
 
-            category = CLASS_NAMES.get(cls_id, "unknown")
+        # --- timestamp for this frame ---
+        time_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+        time_utc = datetime.now(timezone.utc).isoformat()
 
-            vehicle_info.append({
-                "category": category,
-                "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                "score": conf
-            })
+        # --- 3) detect license plates ---
+        try:
+            lps = license_plate_detector(frame, conf=CONF_THRESH, verbose=False)[0]
+            lp_boxes = lps.boxes.data.tolist() if (hasattr(lps, "boxes") and len(lps.boxes)) else []
+        except Exception as e:
+            print(f"[frame {frame_nmr}] license_plate_detector error: {e}")
+            lp_boxes = []
 
-        car_boxes = np.array(car_boxes)
-        
-        print(f"This is vehicle info- {vehicle_info}")
-        # Track cars
-        vehicle_track_ids = tracker.update(car_boxes) if len(car_boxes) > 0 else []
+        # --- 4) assign plates to cars, crop, OCR, store results ---
+        for lp in lp_boxes:
+            x1, y1, x2, y2, score, class_id = lp
 
-        # Detect license plates
-        lp_detections = MODEL_LP.predict(frame, conf=CONF_THRESHOLD, verbose=False)[0]
-        print(f"🧩 DEBUG: Frame {frame_count}: {len(lp_detections.boxes)} license plates detected")
-
-        for lp_box in lp_detections.boxes:
-            # convert to ints for cropping and logs
-            x1, y1, x2, y2 = map(int, lp_box.xyxy[0])
-            h, w = frame.shape[:2]
-            x1c, y1c = max(0, x1), max(0, y1)
-            x2c, y2c = min(w, x2), min(h, y2)
-            if x2c <= x1c or y2c <= y1c:
-                print(f"⚠ Invalid plate bbox after clamp: {(x1, y1, x2, y2)}")
-                continue
-
-            lp_crop = frame[y1c:y2c, x1c:x2c]
-            lp_text, lp_score = util.read_license_plate(lp_crop)
-            print(f"🧩 DEBUG OCR OUTPUT: {lp_text}, score={lp_score}")
-            
-            if not lp_text:
-                print(f"⚠ OCR failed or invalid text for bbox {(x1, y1, x2, y2)}")
-                continue
-
-            # Count detections per plate
-            plate_detection_count[lp_text] = plate_detection_count.get(lp_text, 0) + 1
-
-            if plate_detection_count[lp_text] > MAX_DETECTIONS_PER_PLATE:
-                print(f"⚠ Plate '{lp_text}' detected more than {MAX_DETECTIONS_PER_PLATE} times. Moving to next video...")
-                cap.release()
-                return
-
-            # Match plate with car
-            # We call util.get_car exactly like before, but we'll log and still record if it returns -1
-            xcar1, ycar1, xcar2, ycar2, car_id = util.get_car(
-                (x1, y1, x2, y2, float(lp_box.conf[0]), int(lp_box.cls[0]) if hasattr(lp_box, "cls") else 0),
-                vehicle_track_ids
-            )
+            try:
+                xcar1, ycar1, xcar2, ycar2, car_id = util.get_car(lp, track_ids)
+            except Exception as e:
+                print(f"[frame {frame_nmr}] get_car error: {e}")
+                car_id = -1
+                xcar1 = ycar1 = xcar2 = ycar2 = 0
 
             if car_id == -1:
-                print(f"⚠ No matching car found for plate {lp_text} — WILL still log OCR result into CSV (car_id = -1).")
+                continue
 
-                # create detection dict with empty/placeholder car bbox so CSV writer sees something
-                # detection_dict = {
-                #     "car": {},  # no bbox available
-                #     "license_plate": {
-                #         "bbox": [x1, y1, x2, y2],
-                #         "bbox_score": float(lp_box.conf[0]),
-                #         "text": lp_text,
-                #         "text_score": float(lp_score),
-                #     },
-                #     "detection_time": {
-                #         "time_ms": int(cap.get(cv2.CAP_PROP_POS_MSEC)),
-                #         "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                #     },
-                # }
-                detection_dict = {
-                    "vehicle": vehicle_info,   # <---- NEW SECTION HERE
+            ix1 = max(0, int(x1)); iy1 = max(0, int(y1))
+            ix2 = min(w - 1, int(x2)); iy2 = min(h - 1, int(y2))
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
 
-                    # "car": {},  # (your placeholder, unchanged)
+            licence_crop = frame[iy1:iy2, ix1:ix2]
+            if licence_crop.size == 0:
+                continue
 
-                    "license_plate": {
-                        "bbox": [x1, y1, x2, y2],
-                        "bbox_score": float(lp_box.conf[0]),
-                        "text": lp_text,
-                        "text_score": float(lp_score),
+            try:
+                crop_gray = cv2.cvtColor(licence_crop, cv2.COLOR_BGR2GRAY)
+                _, crop_thresh = cv2.threshold(crop_gray, 64, 255, cv2.THRESH_BINARY_INV)
+                lp_text, lp_text_score = util.read_license_plate(crop_thresh)
+            except Exception as e:
+                print(f"[frame {frame_nmr}] OCR error: {e}")
+                lp_text, lp_text_score = None, 0.0
+
+            if lp_text is not None:
+                results[frame_nmr][car_id] = {
+                    'car': {'bbox': [int(xcar1), int(ycar1), int(xcar2), int(ycar2)]},
+                    'license_plate': {
+                        'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                        'text': lp_text,
+                        'bbox_score': float(score),
+                        'text_score': float(lp_text_score)
                     },
-
-                    "detection_time": {
-                        "time_ms": int(cap.get(cv2.CAP_PROP_POS_MSEC)),
-                        "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                    },
+                    'detection_time': {
+                        'frame': frame_nmr,
+                        'time_ms': float(time_ms),
+                        'time_utc': time_utc
+                    }
                 }
 
-                
-                # Create list if file doesn't exist
-                if not RESULTS_FILE.exists():
-                    with open(RESULTS_FILE, "w", encoding="utf-8") as f:
-                        json.dump([], f)
+                print(f"[frame {frame_nmr}] car_id={car_id} plate='{lp_text}' conf={lp_text_score:.2f} time_ms={time_ms:.1f}")
 
-                # Append current detection_dict
-                with open(RESULTS_FILE, "r+", encoding="utf-8") as f:
-                    data = json.load(f)
-                    data.append(detection_dict)
-                    f.seek(0)
-                    json.dump(data, f, indent=4)
-
-                entry = {"frame": frame_count, "car_id": -1, "data": detection_dict}
-                bbox_score_val = float(lp_box.conf[0])
-
-                # still add to written_plates (so CSV will contain this plate)
-                added = add_or_replace_plate(written_plates, lp_text, entry, bbox_score_val)
-                if added:
-                    print(f"✅ (No car) Added plate {lp_text} (score {bbox_score_val}) to written_plates")
-                continue
-            
-            entry = {"frame": frame_count, "car_id": car_id, "data": detection_dict}
-            bbox_score_val = float(lp_box.conf[0])
-
-            added = add_or_replace_plate(written_plates, lp_text, entry, bbox_score_val)
-            if added:
-                print(f"✅ Added plate {lp_text} (score {bbox_score_val}) to written_plates")
-
-        # Flush CSV dynamically every N frames or on first detection
-        if written_plates and (frame_count % FLUSH_EVERY_N_FRAMES == 0 or not csv_created):
-            print(f"📦 Writing CSV with {len(written_plates)} unique plates...")
-            util.write_csv(build_results_from_written(written_plates), OUT_CSV)
-            csv_created = True
-            print(f"📤 CSV updated at frame {frame_count}")
+        # --- periodic flush to CSV ---
+        if (FLUSH_EVERY_N_FRAMES and frame_nmr % FLUSH_EVERY_N_FRAMES == 0) or (time.time() - last_write > FLUSH_INTERVAL_SECS):
             try:
-                csv_to_slides(OUT_CSV)
-                print(f"📤 Google Sheet updated at frame {frame_count}")
+                util.write_csv(results, OUT_CSV)
+                last_write = time.time()
+                print(f"[frame {frame_nmr}] flushed results -> {OUT_CSV}")
             except Exception as e:
-                print(f"⚠ Google Sheet update failed: {e}")
+                print("Error while flushing CSV:", e)
 
-    # Final flush at video end
-    if written_plates:
-        util.write_csv(build_results_from_written(written_plates), OUT_CSV)
-        print("📤 Final CSV write completed")
-        try:
-            csv_to_slides(OUT_CSV)
-            print("📤 Final Google Sheet update completed!")
-        except Exception as e:
-            print(f"⚠ Google Sheet update failed: {e}")
+        if frame_nmr % PRINT_EVERY_N_FRAMES == 0 and frame_nmr != 0:
+            print(f"Processed frames: {frame_nmr}")
 
+        if stop_requested:
+            print("Stop requested; breaking main loop.")
+            break
+
+finally:
     cap.release()
-    print(f"✅ Finished: {video_path}\n")
+    try:
+        util.write_csv(results, OUT_CSV)
+        print("Final CSV written to:", OUT_CSV)
+    except Exception as e:
+        print("Final write_csv failed:", e)
+
+    print("Processing finished.")
+
+# import time
+# import signal
+# import csv
+# import os
+# from datetime import datetime, timezone
+
+# import cv2
+# import numpy as np
+# from ultralytics import YOLO
+
+# # your util module (must define get_car, read_license_plate, write_csv)
+# import util
+# from sort.sort import Sort
+
+# # ----------------- CONFIG -----------------
+# MODEL_COCO = "yolov8n.pt"                 # vehicle detector
+# MODEL_LP = "license_plate_detector.pt"    # license plate detector provided by repo
+# FRAMES_DIR = "/content/drive/MyDrive/motion_frames"  # path to folder with frames
+# OUT_CSV = "./test.csv"                    # CSV to write (full dump)
+# CONF_THRESH = 0.25                        # detection confidence threshold
+# VEHICLE_CLASSES = [2, 3, 5, 7]            # COCO class ids considered "vehicles"
+# FLUSH_INTERVAL_SECS = 5                   # flush CSV at least every N seconds
+# FLUSH_EVERY_N_FRAMES = 100                # also flush every N frames
+# PRINT_EVERY_N_FRAMES = 100                # show progress every N frames
+# # ------------------------------------------
+
+# # tracker
+# mot_tracker = Sort()
+
+# # load models
+# print("Loading YOLO models...")
+# coco_model = YOLO(MODEL_COCO)
+# license_plate_detector = YOLO(MODEL_LP)
+# print("Models loaded.")
+
+# # --- Load frames instead of video ---
+# if not os.path.exists(FRAMES_DIR):
+#     raise SystemExit(f"Frame directory does not exist: {FRAMES_DIR}")
+
+# frame_files = sorted([
+#     os.path.join(FRAMES_DIR, f)
+#     for f in os.listdir(FRAMES_DIR)
+#     if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+# ])
+
+# if not frame_files:
+#     raise SystemExit(f"No frames found in: {FRAMES_DIR}")
+
+# print(f"Starting processing {len(frame_files)} frames from: {FRAMES_DIR}")
+
+# # results dict (same structure as before)
+# results = {}
+
+# # graceful stop variables
+# last_write = time.time()
+# stop_requested = False
 
 
-def main():
-    if os.path.exists(OUT_CSV):
-        os.remove(OUT_CSV)
-        print("🗑 Old CSV removed")
-
-    for filename in os.listdir(VIDEO_DIR):
-        if filename.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-            video_path = os.path.join(VIDEO_DIR, filename)
-            process_video(video_path)
-
-    print("🏁 All videos processed successfully!")
+# def _sigint_handler(sig, frame):
+#     global stop_requested
+#     print("\nSIGINT received — will stop after finishing current frame and flush CSV.")
+#     stop_requested = True
 
 
-if __name__ == "__main__":
-    main()
+# signal.signal(signal.SIGINT, _sigint_handler)
+
+# frame_nmr = -1
+
+# try:
+#     for frame_path in frame_files:
+#         frame_nmr += 1
+#         frame = cv2.imread(frame_path)
+#         if frame is None:
+#             print(f"Skipping unreadable frame: {frame_path}")
+#             continue
+
+#         h, w = frame.shape[:2]
+#         if h == 0 or w == 0:
+#             print(f"Skipping empty frame {frame_nmr}: {frame_path}")
+#             continue
+
+#         results.setdefault(frame_nmr, {})
+
+#         # --- 1) detect vehicles (COCO) ---
+#         try:
+#             dets = coco_model(frame, conf=CONF_THRESH, verbose=False)[0]
+#         except Exception as e:
+#             print(f"[frame {frame_nmr}] coco_model inference error: {e}")
+#             dets = None
+
+#         detections_ = []
+#         if dets and hasattr(dets, "boxes") and len(dets.boxes):
+#             for detection in dets.boxes.data.tolist():
+#                 x1, y1, x2, y2, score, class_id = detection
+#                 if int(class_id) in VEHICLE_CLASSES:
+#                     detections_.append([x1, y1, x2, y2, score])
+
+#         dets_np = np.asarray(detections_) if len(detections_) else np.empty((0, 5))
+
+#         # --- 2) update tracker (SORT) ---
+#         try:
+#             track_ids = mot_tracker.update(dets_np)
+#         except Exception as e:
+#             print(f"[frame {frame_nmr}] SORT update error: {e}")
+#             track_ids = np.empty((0, 5))
+
+#         # --- timestamp (simulated for frame files) ---
+#         time_ms = frame_nmr * 40  # assuming ~25 FPS
+#         time_utc = datetime.now(timezone.utc).isoformat()
+
+#         # --- 3) detect license plates ---
+#         try:
+#             lps = license_plate_detector(frame, conf=CONF_THRESH, verbose=False)[0]
+#             lp_boxes = lps.boxes.data.tolist() if (hasattr(lps, "boxes") and len(lps.boxes)) else []
+#         except Exception as e:
+#             print(f"[frame {frame_nmr}] license_plate_detector error: {e}")
+#             lp_boxes = []
+
+#         # --- 4) assign plates to cars, crop, OCR, store results ---
+#         for lp in lp_boxes:
+#             x1, y1, x2, y2, score, class_id = lp
+
+#             try:
+#                 xcar1, ycar1, xcar2, ycar2, car_id = util.get_car(lp, track_ids)
+#             except Exception as e:
+#                 print(f"[frame {frame_nmr}] get_car error: {e}")
+#                 car_id = -1
+#                 xcar1 = ycar1 = xcar2 = ycar2 = 0
+
+#             if car_id == -1:
+#                 continue
+
+#             ix1 = max(0, int(x1)); iy1 = max(0, int(y1))
+#             ix2 = min(w - 1, int(x2)); iy2 = min(h - 1, int(y2))
+#             if ix2 <= ix1 or iy2 <= iy1:
+#                 continue
+
+#             licence_crop = frame[iy1:iy2, ix1:ix2]
+#             if licence_crop.size == 0:
+#                 continue
+
+#             try:
+#                 crop_gray = cv2.cvtColor(licence_crop, cv2.COLOR_BGR2GRAY)
+#                 _, crop_thresh = cv2.threshold(crop_gray, 64, 255, cv2.THRESH_BINARY_INV)
+#                 lp_text, lp_text_score = util.read_license_plate(crop_thresh)
+#             except Exception as e:
+#                 print(f"[frame {frame_nmr}] OCR error: {e}")
+#                 lp_text, lp_text_score = None, 0.0
+
+#             if lp_text is not None:
+#                 results[frame_nmr][car_id] = {
+#                     'car': {'bbox': [int(xcar1), int(ycar1), int(xcar2), int(ycar2)]},
+#                     'license_plate': {
+#                         'bbox': [int(x1), int(y1), int(x2), int(y2)],
+#                         'text': lp_text,
+#                         'bbox_score': float(score),
+#                         'text_score': float(lp_text_score)
+#                     },
+#                     'detection_time': {
+#                         'frame': frame_nmr,
+#                         'time_ms': float(time_ms),
+#                         'time_utc': time_utc
+#                     }
+#                 }
+
+#                 print(f"[frame {frame_nmr}] car_id={car_id} plate='{lp_text}' conf={lp_text_score:.2f} time_ms={time_ms:.1f}")
+
+#         # --- periodic flush to CSV ---
+#         if (FLUSH_EVERY_N_FRAMES and frame_nmr % FLUSH_EVERY_N_FRAMES == 0) or (time.time() - last_write > FLUSH_INTERVAL_SECS):
+#             try:
+#                 util.write_csv(results, OUT_CSV)
+#                 last_write = time.time()
+#                 print(f"[frame {frame_nmr}] flushed results -> {OUT_CSV}")
+#             except Exception as e:
+#                 print("Error while flushing CSV:", e)
+
+#         if frame_nmr % PRINT_EVERY_N_FRAMES == 0 and frame_nmr != 0:
+#             print(f"Processed frames: {frame_nmr}")
+
+#         if stop_requested:
+#             print("Stop requested; breaking main loop.")
+#             break
+
+# finally:
+#     try:
+#         util.write_csv(results, OUT_CSV)
+#         print("Final CSV written to:", OUT_CSV)
+#     except Exception as e:
+#         print("Final write_csv failed:", e)
+
+#     print("Processing finished.")
