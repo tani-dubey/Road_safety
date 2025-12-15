@@ -75,6 +75,6 @@ data/
 token.pickle
 
 # ===============================
-# Third-party code copies
-# ===============================
+# Miscellaneous
+util.py
 sort/
