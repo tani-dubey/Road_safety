@@ -8,7 +8,7 @@ from ultralytics import YOLO
 
 from src.writers import init_csv, write_csv_row,write_json_event
 import src.util as util
-from src.tracking.sort import Sort
+from src.third_party.sort import Sort
 
 # ----------------- CONFIG -----------------
 MODEL_COCO = "././model/yolov8n.pt"                 # vehicle detector
