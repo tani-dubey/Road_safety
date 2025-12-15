@@ -160,9 +160,12 @@ cython_debug/
 #.idea/
 
 anpr_test/
-sample.mp4
+sample_vids/
 sort/
 test_interpolated.csv
 test.csv
 out.mp4
 yolov8n.pt
+license_plate_detector_3.pt
+model/
+token.pickle

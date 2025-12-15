@@ -1,5 +1,7 @@
 import string
 import easyocr
+import csv
+import os
 
 # Initialize the OCR reader
 reader = easyocr.Reader(['en'], gpu=False)
@@ -22,77 +24,68 @@ dict_int_to_char = {'0': 'O',
 
 def write_csv(results, output_path):
     """
-    Write the results to a CSV file.
-
-    Args:
-        results (dict): Dictionary containing the results.
-        output_path (str): Path to the output CSV file.
+    Write results (with timestamps) to CSV.
+    Appends new detections and creates the file if it doesn't exist.
     """
-    with open(output_path, 'w') as f:
-        f.write('{},{},{},{},{},{},{}\n'.format('frame_nmr', 'car_id', 'car_bbox',
-                                                'license_plate_bbox', 'license_plate_bbox_score', 'license_number',
-                                                'license_number_score'))
+    rows = []
+    for frame_nmr, cars in results.items():
+        for car_id, data in cars.items():
+            lp = data.get('license_plate', {})
+            car = data.get('car', {})
+            det_time = data.get('detection_time', {})
 
-        for frame_nmr in results.keys():
-            for car_id in results[frame_nmr].keys():
-                print(results[frame_nmr][car_id])
-                if 'car' in results[frame_nmr][car_id].keys() and \
-                   'license_plate' in results[frame_nmr][car_id].keys() and \
-                   'text' in results[frame_nmr][car_id]['license_plate'].keys():
-                    f.write('{},{},{},{},{},{},{}\n'.format(frame_nmr,
-                                                            car_id,
-                                                            '[{} {} {} {}]'.format(
-                                                                results[frame_nmr][car_id]['car']['bbox'][0],
-                                                                results[frame_nmr][car_id]['car']['bbox'][1],
-                                                                results[frame_nmr][car_id]['car']['bbox'][2],
-                                                                results[frame_nmr][car_id]['car']['bbox'][3]),
-                                                            '[{} {} {} {}]'.format(
-                                                                results[frame_nmr][car_id]['license_plate']['bbox'][0],
-                                                                results[frame_nmr][car_id]['license_plate']['bbox'][1],
-                                                                results[frame_nmr][car_id]['license_plate']['bbox'][2],
-                                                                results[frame_nmr][car_id]['license_plate']['bbox'][3]),
-                                                            results[frame_nmr][car_id]['license_plate']['bbox_score'],
-                                                            results[frame_nmr][car_id]['license_plate']['text'],
-                                                            results[frame_nmr][car_id]['license_plate']['text_score'])
-                            )
-        f.close()
+            # Only write valid detections with recognized text
+            if 'text' in lp:
+                rows.append({
+                    'frame_nmr': frame_nmr,
+                    'car_id': car_id,
+                    'car_bbox': f"[{car['bbox'][0]} {car['bbox'][1]} {car['bbox'][2]} {car['bbox'][3]}]" if 'bbox' in car else '',
+                    'license_plate_bbox': f"[{lp['bbox'][0]} {lp['bbox'][1]} {lp['bbox'][2]} {lp['bbox'][3]}]" if 'bbox' in lp else '',
+                    'license_plate_bbox_score': lp.get('bbox_score', ''),
+                    'license_number': lp.get('text', ''),
+                    'license_number_score': lp.get('text_score', ''),
+                    'timestamp_ms': det_time.get('time_ms', ''),
+                    'timestamp_utc': det_time.get('time_utc', '')
+                })
+
+    fieldnames = [
+        'frame_nmr',
+        'car_id',
+        'car_bbox',
+        'license_plate_bbox',
+        'license_plate_bbox_score',
+        'license_number',
+        'license_number_score',
+        'timestamp_ms',
+        'timestamp_utc'
+    ]
+
+    file_exists = os.path.exists(output_path)
+    with open(output_path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 def license_complies_format(text):
-    """
-    Check if the license plate text complies with the required format.
+    # if len(text) != 7:
+    #     return False
 
-    Args:
-        text (str): License plate text.
-
-    Returns:
-        bool: True if the license plate complies with the format, False otherwise.
-    """
-    if len(text) != 7:
-        return False
-
-    if (text[0] in string.ascii_uppercase or text[0] in dict_int_to_char.keys()) and \
-       (text[1] in string.ascii_uppercase or text[1] in dict_int_to_char.keys()) and \
-       (text[2] in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] or text[2] in dict_char_to_int.keys()) and \
-       (text[3] in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] or text[3] in dict_char_to_int.keys()) and \
-       (text[4] in string.ascii_uppercase or text[4] in dict_int_to_char.keys()) and \
-       (text[5] in string.ascii_uppercase or text[5] in dict_int_to_char.keys()) and \
-       (text[6] in string.ascii_uppercase or text[6] in dict_int_to_char.keys()):
-        return True
-    else:
-        return False
+    # if (text[0] in string.ascii_uppercase or text[0] in dict_int_to_char.keys()) and \
+    #    (text[1] in string.ascii_uppercase or text[1] in dict_int_to_char.keys()) and \
+    #    (text[2] in ['0','1','2','3','4','5','6','7','8','9'] or text[2] in dict_char_to_int.keys()) and \
+    #    (text[3] in ['0','1','2','3','4','5','6','7','8','9'] or text[3] in dict_char_to_int.keys()) and \
+    #    (text[4] in string.ascii_uppercase or text[4] in dict_int_to_char.keys()) and \
+    #    (text[5] in string.ascii_uppercase or text[5] in dict_int_to_char.keys()) and \
+    #    (text[6] in string.ascii_uppercase or text[6] in dict_int_to_char.keys()):
+    #     return True
+    # else:
+    #     return False
+    return len(text) >= 4
 
 
 def format_license(text):
-    """
-    Format the license plate text by converting characters using the mapping dictionaries.
-
-    Args:
-        text (str): License plate text.
-
-    Returns:
-        str: Formatted license plate text.
-    """
     license_plate_ = ''
     mapping = {0: dict_int_to_char, 1: dict_int_to_char, 4: dict_int_to_char, 5: dict_int_to_char, 6: dict_int_to_char,
                2: dict_char_to_int, 3: dict_char_to_int}
@@ -101,28 +94,29 @@ def format_license(text):
             license_plate_ += mapping[j][text[j]]
         else:
             license_plate_ += text[j]
-
     return license_plate_
 
 
 def read_license_plate(license_plate_crop):
-    """
-    Read the license plate text from the given cropped image.
-
-    Args:
-        license_plate_crop (PIL.Image.Image): Cropped image containing the license plate.
-
-    Returns:
-        tuple: Tuple containing the formatted license plate text and its confidence score.
-    """
+    # detections = reader.readtext(license_plate_crop)
+    # for detection in detections:
+    #     bbox, text, score = detection
+    #     text = text.upper().replace(' ', '')
+    #     if license_complies_format(text):
+    #         return format_license(text), score
+    # return None, None
+    h, w = license_plate_crop.shape[:2]
+    if h == 0 or w == 0:
+        return None, None
 
     detections = reader.readtext(license_plate_crop)
+    if not detections:
+        return None, None
 
     for detection in detections:
         bbox, text, score = detection
-
         text = text.upper().replace(' ', '')
-
+        print(f"🔹 OCR raw text: '{text}' with score {score}")  # log every OCR attempt
         if license_complies_format(text):
             return format_license(text), score
 
@@ -130,28 +124,9 @@ def read_license_plate(license_plate_crop):
 
 
 def get_car(license_plate, vehicle_track_ids):
-    """
-    Retrieve the vehicle coordinates and ID based on the license plate coordinates.
-
-    Args:
-        license_plate (tuple): Tuple containing the coordinates of the license plate (x1, y1, x2, y2, score, class_id).
-        vehicle_track_ids (list): List of vehicle track IDs and their corresponding coordinates.
-
-    Returns:
-        tuple: Tuple containing the vehicle coordinates (x1, y1, x2, y2) and ID.
-    """
     x1, y1, x2, y2, score, class_id = license_plate
-
-    foundIt = False
     for j in range(len(vehicle_track_ids)):
         xcar1, ycar1, xcar2, ycar2, car_id = vehicle_track_ids[j]
-
         if x1 > xcar1 and y1 > ycar1 and x2 < xcar2 and y2 < ycar2:
-            car_indx = j
-            foundIt = True
-            break
-
-    if foundIt:
-        return vehicle_track_ids[car_indx]
-
+            return xcar1, ycar1, xcar2, ycar2, car_id
     return -1, -1, -1, -1, -1
