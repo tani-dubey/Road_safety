@@ -85,6 +85,10 @@ data/
    ```text
    pip install -r requirements.txt
     ```
+2. To run as an API service:
+   ```bash
+   uvicorn main:app --reload
+   ```
 3. Run the pipeline
    ```text
    python main.py
