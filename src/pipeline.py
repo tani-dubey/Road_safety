@@ -6,52 +6,64 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from src.writers import init_csv, write_csv_row,write_json_event
+from src.writers import init_csv, write_csv_row,write_json_event,already_exist
 import src.util as util
 from src.third_party.sort import Sort
 
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent  # src/
+
 # ----------------- CONFIG -----------------
-MODEL_COCO = "././model/yolov8n.pt"                 # vehicle detector
-MODEL_LP = "././model/license_plate_detector_3.pt"   # license plate detector provided by repo
-VIDEO_PATH = "././sample_video/sample.mp4"              # input video
-OUT_CSV = "././data/test.csv"                   # CSV to write (full dump)
-JSON_OUT = "././data/events.jsonl"
+MODEL_COCO =  BASE_DIR/"model/yolov8n.pt"                 # vehicle detector
+MODEL_LP =  BASE_DIR/"model/license_plate_detector_3.pt"   # license plate detector
+
+
+OUT_CSV = BASE_DIR /"data/test.csv"                   # CSV to write
+JSON_OUT = BASE_DIR /"data/events.jsonl"
 
 CONF_THRESH = 0.25                       # detection confidence threshold
 VEHICLE_CLASSES = [2, 3, 5, 7]           # COCO class ids considered "vehicles" (car, motorcycle, bus, truck etc.)
-FLUSH_INTERVAL_SECS = 5                  # flush CSV at least every N seconds
-FLUSH_EVERY_N_FRAMES = 100               # also flush every N frames
 PRINT_EVERY_N_FRAMES = 100               # show progress every N frames
 # ------------------------------------------
 
-# -------- Shutdown --------
-stop_requested = False
+# # -------- Shutdown --------
+# stop_requested = False
 
-def _sigint_handler(sig, frame):
-    global stop_requested
-    print("\nSIGINT received — will stop after finishing current frame and flush CSV.")
-    stop_requested = True
+# def _sigint_handler(sig, frame):
+#     global stop_requested
+#     print("\nSIGINT received — will stop after finishing current frame and flush CSV.")
+#     stop_requested = True
 
-signal.signal(signal.SIGINT, _sigint_handler)
-# -----------------------------------
+# signal.signal(signal.SIGINT, _sigint_handler)
+# # -----------------------------------
 
-def main():
+def run_pipeline(
+    video_path: str,
+    OUT_CSV: str = OUT_CSV,
+    JSON_OUT: str = JSON_OUT,
+) -> dict:
+    
     print("Loading models...")
     vehicle_model = YOLO(MODEL_COCO)
     lp_model = YOLO(MODEL_LP)
     tracker = Sort()
     print("Models loaded.")
 
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise SystemExit(f"Cannot open video: {VIDEO_PATH}")
-
+        raise SystemExit(f"Cannot open video: {video_path}")
+    
+    print(already_exist(OUT_CSV,JSON_OUT))
+        
     init_csv(OUT_CSV)
 
     written_events = set()
     frame_nmr = -1
+    total_frames= 0
+    unique_vehicle=set()
 
-    print(f"Processing video: {VIDEO_PATH}")
+    print(f"Processing video: {video_path}")
 
     while True:
         frame_nmr += 1
@@ -60,7 +72,9 @@ def main():
         if not ret:
             print("End of video.")
             break
-
+        
+        total_frames+=1
+        
         # timestamps
         time_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
         time_utc = datetime.now(timezone.utc).isoformat()
@@ -95,7 +109,9 @@ def main():
             xcar1, ycar1, xcar2, ycar2, car_id = util.get_car(lp, track_ids)
             if car_id == -1:
                 continue
-
+            
+            unique_vehicle.add(car_id)
+            
             key = (frame_nmr, car_id)
             if key in written_events:
                 continue
@@ -157,15 +173,25 @@ def main():
                 f"plate='{lp_text}' conf={lp_text_score:.2f}"
             )
 
-        if frame_nmr % PRINT_EVERY_N_FRAMES == 0 and frame_nmr != 0:
-            print(f"Processed frames: {frame_nmr}")
+        # if frame_nmr % PRINT_EVERY_N_FRAMES == 0 and frame_nmr != 0:
+        #     print(f"Processed frames: {frame_nmr}")
 
-        if stop_requested:
-            break
+        # if stop_requested:
+        #     break
 
     cap.release()
     print("Pipeline finished cleanly.")
+    
+    return {
+        "total_frames": total_frames,
+        "total_vehicles" :len(unique_vehicle),
+        "output_files" :[str(OUT_CSV), str(JSON_OUT)]
+    }
 
-
+# -------- CLI entry (runs on terminal) --------
+def main():
+    video_path= BASE_DIR/"sample_video/sample.mp4"
+    run_pipeline(video_path)
+    
 if __name__ == "__main__":
     main()

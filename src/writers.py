@@ -28,3 +28,19 @@ def write_csv_row(OUT_CSV, row):
 def write_json_event(JSON_OUT, event):
     with open(JSON_OUT, "a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
+
+def already_exist(out_csv: str, json_out: str) -> dict:
+    deleted = []
+
+    if os.path.exists(out_csv):
+        os.remove(out_csv)
+        deleted.append(out_csv)
+
+    if os.path.exists(json_out):
+        os.remove(json_out)
+        deleted.append(json_out)
+
+    return {
+        "deleted_files": deleted,
+        "count": len(deleted)
+    }
