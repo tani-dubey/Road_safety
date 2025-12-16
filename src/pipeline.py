@@ -9,10 +9,12 @@ from ultralytics import YOLO
 from src.writers import init_csv, write_csv_row,write_json_event,already_exist
 import src.util as util
 from src.third_party.sort import Sort
+from src.routers.route_metrices import get_metrics
 
+import openvino as ov
 from pathlib import Path
-
 BASE_DIR = Path(__file__).resolve().parent.parent  # src/
+
 
 # ----------------- CONFIG -----------------
 MODEL_COCO =  BASE_DIR/"model/yolov8n.pt"                 # vehicle detector
@@ -27,27 +29,36 @@ VEHICLE_CLASSES = [2, 3, 5, 7]           # COCO class ids considered "vehicles" 
 PRINT_EVERY_N_FRAMES = 100               # show progress every N frames
 # ------------------------------------------
 
-# # -------- Shutdown --------
-# stop_requested = False
-
-# def _sigint_handler(sig, frame):
-#     global stop_requested
-#     print("\nSIGINT received — will stop after finishing current frame and flush CSV.")
-#     stop_requested = True
-
-# signal.signal(signal.SIGINT, _sigint_handler)
-# # -----------------------------------
 
 def run_pipeline(
     video_path: str,
+    Use_OpenVINO: bool,
     OUT_CSV: str = OUT_CSV,
     JSON_OUT: str = JSON_OUT,
 ) -> dict:
     
+    USE_OPENVINO = Use_OpenVINO
+
     print("Loading models...")
-    vehicle_model = YOLO(MODEL_COCO)
+    if not USE_OPENVINO:
+        vehicle_model = YOLO(MODEL_COCO)
+        infer_request= None
+        print("Vechicle detection using : PyTorch")
+    else:
+        core=ov.Core()
+        ov_model= core.read_model(
+            BASE_DIR/ "model/yolov8n_openvino_model/yolov8n.xml"
+        )
+        vehicle_model=core.compile_model(
+            ov_model, "AUTO:GPU,CPU"
+        )
+        infer_request=vehicle_model.create_infer_request()
+        print("Vehicle detction using : OpenVINO")
+        
+    # --- License plate model stays PyTorch ---
     lp_model = YOLO(MODEL_LP)
     tracker = Sort()
+
     print("Models loaded.")
 
     cap = cv2.VideoCapture(video_path)
@@ -80,19 +91,11 @@ def run_pipeline(
         time_utc = datetime.now(timezone.utc).isoformat()
 
         # -------- 1. Vehicle detection --------
-        vehicle_dets = []
-        dets = vehicle_model(frame, conf=CONF_THRESH, verbose=False)[0]
-
-        if dets and hasattr(dets, "boxes"):
-            for d in dets.boxes.data.tolist():
-                x1, y1, x2, y2, score, class_id = d
-                if int(class_id) in VEHICLE_CLASSES:
-                    vehicle_dets.append([x1, y1, x2, y2, score])
-
-        vehicle_dets = (
-            np.asarray(vehicle_dets) if vehicle_dets else np.empty((0, 5))
-        )
-
+        if not USE_OPENVINO:
+            vehicle_dets= detect_vehiches_pytorch(frame,vehicle_model)
+        else:
+            vehicle_dets= detect_vehicles_openvino(frame, infer_request)
+            
         # -------- 2. Tracking --------
         track_ids = tracker.update(vehicle_dets)
 
@@ -172,13 +175,7 @@ def run_pipeline(
                 f"[frame {frame_nmr}] car_id={car_id} "
                 f"plate='{lp_text}' conf={lp_text_score:.2f}"
             )
-
-        # if frame_nmr % PRINT_EVERY_N_FRAMES == 0 and frame_nmr != 0:
-        #     print(f"Processed frames: {frame_nmr}")
-
-        # if stop_requested:
-        #     break
-
+            
     cap.release()
     print("Pipeline finished cleanly.")
     
@@ -187,6 +184,57 @@ def run_pipeline(
         "total_vehicles" :len(unique_vehicle),
         "output_files" :[str(OUT_CSV), str(JSON_OUT)]
     }
+    
+def detect_vehiches_pytorch(frame,vehicle_model):
+    vehicle_dets = []
+    dets = vehicle_model(frame, conf=CONF_THRESH, verbose=False)[0] 
+    
+    if dets and hasattr(dets, "boxes"):
+        for d in dets.boxes.data.tolist():
+            x1, y1, x2, y2, score, class_id = d
+            if int(class_id) in VEHICLE_CLASSES:
+                vehicle_dets.append([x1, y1, x2, y2, score])
+
+    vehicle_dets = (
+        np.asarray(vehicle_dets) if vehicle_dets else np.empty((0, 5))
+    )
+    return vehicle_dets
+
+def detect_vehicles_openvino(frame, infer_request):
+    vehicle_dets = []
+
+    # preprocess
+    img = cv2.resize(frame, (640, 640))
+    img = img.transpose(2, 0, 1)
+    img = np.expand_dims(img, axis=0)
+    img = img.astype(np.float32) / 255.0
+
+    # inference
+    outputs = infer_request.infer({0: img})
+    pred = list(outputs.values())[0][0]   # (84, 8400)
+
+    h, w = frame.shape[:2]
+
+    for i in range(pred.shape[1]):
+        scores = pred[4:, i]
+        class_id = int(np.argmax(scores))
+        score = scores[class_id]
+
+        if score < CONF_THRESH:
+            continue
+        if class_id not in VEHICLE_CLASSES:
+            continue
+
+        cx, cy, bw, bh = pred[:4, i]
+        x1 = int((cx - bw / 2) * w / 640)
+        y1 = int((cy - bh / 2) * h / 640)
+        x2 = int((cx + bw / 2) * w / 640)
+        y2 = int((cy + bh / 2) * h / 640)
+
+        vehicle_dets.append([x1, y1, x2, y2, score])
+
+    return np.asarray(vehicle_dets) if vehicle_dets else np.empty((0, 5))
+
 
 # -------- CLI entry (runs on terminal) --------
 def main():

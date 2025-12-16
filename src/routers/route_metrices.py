@@ -7,5 +7,5 @@ def get_metrics():
     return {
         "supported_models": ["YOLOv8"],
         "Cpu_interface": True,
-        "Openvino_ready": False
+        "Openvino_ready": True
     }

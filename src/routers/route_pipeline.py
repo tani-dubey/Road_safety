@@ -8,7 +8,7 @@ router = APIRouter(tags=["route_pipe"])
 @router.post("/infer", response_model=InferenceResponse)
 def run_route_pipe(req: InferenceRequest):
     try:
-        result = run_pipeline(req.video_path)
+        result = run_pipeline(req.video_path, req.Use_OpenVINO)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

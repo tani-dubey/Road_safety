@@ -3,6 +3,7 @@ from typing import List
 
 class InferenceRequest(BaseModel):
     video_path: str
+    Use_OpenVINO: bool
 
 class InferenceResponse(BaseModel):
     total_frames: int
