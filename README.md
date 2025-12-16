@@ -4,6 +4,8 @@ A modular video-based ANPR system that detects vehicles, tracks them across fram
 
 Designed with clean separation of concerns and pipeline-based architecture, making it suitable for research, deployment, and future optimization (e.g., OpenVINO).
 
+This project converts raw traffic video into structured, analytics-ready events
+rather than only performing object detection.
 
 **✨ Features**
 
@@ -11,14 +13,24 @@ Designed with clean separation of concerns and pipeline-based architecture, maki
 * Vehicle tracking using SORT
 * License plate detection using YOLO
 * License plate OCR using EasyOCR
+* **Car ↔ license plate association logic**
 * Timestamped outputs in CSV and JSON
+* **Event-based JSONL output for analytics pipelines**
 * Clean, modular, mentor-ready project structure
+* **FastAPI route for running the pipeline as a service**
 
 **📁 Project Structure**
 ```text
 project-root/
 ├── src/
-│   |
+│   ├── routers/             # FastAPI route definitions
+│   │   ├── route_health.py  # Health check endpoint
+│   │   ├── route_metrics.py # Metrics / stats endpoints
+│   │   └── route_pipeline.py# Inference pipeline endpoint
+│   │
+│   ├── schema/              # Request/response data models
+│   │   └── schema.py        # Pydantic schemas
+|   |  
 │   ├── pipeline.py            # Orchestrates full pipeline
 │   ├── writers.py             # CSV & JSON writing logic
 │   ├── util.py                # OCR & car–plate association
@@ -43,22 +55,21 @@ project-root/
 ```
 **🔐 Credentials & Sensitive Files**
 
-This project does NOT require any API keys or external credentials.
-
-Ignored sensitive / runtime files:
-* .env
-* token.pickle
-* model weights (*.pt)
+1. Model weights are excluded from the repository for size and licensing reasons
+   and must be downloaded separately using the links below.
   
   * license_plate_detector_3.pt : https://drive.google.com/file/d/1x8JX678ifE6xXMzTUSN509oEudFXQ0Ac/view?usp=drive_link
   * yolov8n.pt : https://drive.google.com/file/d/1v9J71JRUy7azjnhlpB3MvEMO0rpXfUhD/view?usp=drive_link
     
-* generated CSV / JSON outputs
-* Sample data to test working : https://drive.google.com/file/d/1D_OLOY5hkPcQfv93_3PZYAzyuvJsbLke/view?usp=drive_link
-* All such files are excluded via .gitignore.
+2. generated CSV / JSON outputs
+3. Sample data to test working : https://drive.google.com/file/d/1D_OLOY5hkPcQfv93_3PZYAzyuvJsbLke/view?usp=drive_link
+
+All such files are excluded via .gitignore.
 
 **📦 Directory Setup (Required)**
-Before running the project, ensure the following structure exists:
+The pipeline assumes this directory structure and will fail if required
+models or input videos are missing.
+
 ```text
 model/
   ├── yolov8n.pt
@@ -80,8 +91,9 @@ data/
     ```
 **✉️ Input Sample**
 
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/5b8ddcdd-c3ae-49c9-acaa-b8bf1e4da586" />
+![Video Project](https://github.com/user-attachments/assets/d68ea5db-03b0-4690-ad7a-1b9a47828fc4)
 
+Download this video : https://drive.google.com/file/d/1D_OLOY5hkPcQfv93_3PZYAzyuvJsbLke/view?usp=drive_link
 
 **📤 Output Format**
 1. CSV (` data/test.csv `) :- 
@@ -125,7 +137,7 @@ frame_nmr,car_id,car_bbox,license_plate_bbox,license_plate_bbox_score,license_nu
 
 🔹 Intelligence & Analytics
 
-    * Traffic rule violation detection
+    * Traffic rule violation detection (rule-based or ML-assisted)
     * Vehicle re-identification across cameras
     * Integration with dashboards and alerting systems
 
@@ -143,3 +155,7 @@ This repository emphasizes:
  * Clean separation of concerns
  * Reproducibility
  * Extendability for research and deployment
+   
+The project is intentionally kept readable and framework-light to support
+onboarding, refactoring, and OSS-style collaboration.
+
